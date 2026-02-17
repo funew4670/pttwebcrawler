@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>World Map 3 - TopoJSON Polygons</title>
+  <link rel="icon" href="data:;base64,=" />
+  <style>
+    :root {
+      color-scheme: light;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      /* Page background (space/sky gradient, not map geometry) */
+      background: radial-gradient(circle at 20% 20%, #1b2a44 0%, #0a0f1a 45%, #05070c 100%);
+      font-family: "Fira Sans", "Segoe UI", system-ui, sans-serif;
+      /* Default text color for UI labels */
+      color: #ebeef1;
+    }
+    #app {
+      width: 100%;
+      height: 100%;
+    }
+    #status {
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      padding: 6px 10px;
+      font-size: 12px;
+      /* Status text color */
+      color: #cfd7e6;
+      /* Status panel background */
+      background: rgba(10, 15, 26, 0.65);
+      /* Status panel border color */
+      border: 1px solid rgba(243, 237, 237, 0.08);
+      border-radius: 8px;
+    }
+    canvas {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="status">Loading country polygons...</div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.161.0/examples/jsm/",
+        "topojson-client": "https://cdn.jsdelivr.net/npm/topojson-client@3/+esm"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { feature } from 'topojson-client';
+
+    const app = document.getElementById('app');
+    const statusEl = document.getElementById('status');
+
+    const scene = new THREE.Scene();
+    // Scene fog color (distance haze/background atmosphere)
+    scene.fog = new THREE.Fog(0x05070c, 12, 30);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 3.0, 7.2);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.minDistance = 4.0;
+    controls.maxDistance = 12.0;
+
+    const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(ambient);
+    const directional = new THREE.DirectionalLight(0xffffff, 1.0);
+    directional.position.set(6, 4, 6);
+    scene.add(directional);
+
+    const globeRadius = 2.5;
+    const globeGeometry = new THREE.SphereGeometry(globeRadius, 64, 64);
+    const globeMaterial = new THREE.MeshStandardMaterial({
+      // Globe base color: ocean/planet surface color
+      color: 0xebeef1,
+      roughness: 0.8,
+      metalness: 0.05,
+      // Globe emissive color: subtle night-side glow
+      emissive: 0x081424,
+      emissiveIntensity: 0.4
+    });
+    const globe = new THREE.Mesh(globeGeometry, globeMaterial);
+    scene.add(globe);
+
+    const polygonsGroup = new THREE.Group();
+    scene.add(polygonsGroup);
+
+    function lonLatToVector3(lon, lat, radius) {
+      const phi = (90 - lat) * (Math.PI / 180);
+      const theta = (lon + 180) * (Math.PI / 180);
+      const x = -radius * Math.sin(phi) * Math.cos(theta);
+      const z = radius * Math.sin(phi) * Math.sin(theta);
+      const y = radius * Math.cos(phi);
+      return new THREE.Vector3(x, y, z);
+    }
+
+    function normalizeRing(ring) {
+      if (!Array.isArray(ring) || ring.length < 3) return [];
+      const clean = ring.slice();
+      const first = clean[0];
+      const last = clean[clean.length - 1];
+      if (first && last && first[0] === last[0] && first[1] === last[1]) {
+        clean.pop();
+      }
+      if (clean.length < 3) return [];
+
+      // Unwrap longitudes to prevent giant triangles across the antimeridian.
+      const out = [];
+      let prevLon = clean[0][0];
+      out.push(new THREE.Vector2(prevLon, clean[0][1]));
+      for (let i = 1; i < clean.length; i++) {
+        let lon = clean[i][0];
+        const lat = clean[i][1];
+        while (lon - prevLon > 180) lon -= 360;
+        while (lon - prevLon < -180) lon += 360;
+        out.push(new THREE.Vector2(lon, lat));
+        prevLon = lon;
+      }
+      return out;
+    }
+
+    function densifyRing(points, maxStepDeg = 1.5) {
+      if (!points || points.length < 2) return points || [];
+      const out = [];
+      for (let i = 0; i < points.length; i++) {
+        const a = points[i];
+        const b = points[(i + 1) % points.length];
+        out.push(a);
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const dist = Math.hypot(dx, dy);
+        const steps = Math.floor(dist / maxStepDeg);
+        if (steps > 0) {
+          for (let s = 1; s <= steps; s++) {
+            const t = s / (steps + 1);
+            out.push(new THREE.Vector2(a.x + dx * t, a.y + dy * t));
+          }
+        }
+      }
+      return out;
+    }
+
+    function midpoint2D(a, b) {
+      return new THREE.Vector2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+    }
+
+    function edgeLen2D(a, b) {
+      return Math.hypot(b.x - a.x, b.y - a.y);
+    }
+
+    function pushTriSubdivided(a, b, c, radius, positions, maxEdgeDeg = 8, depth = 0, maxDepth = 4) {
+      const ab = edgeLen2D(a, b);
+      const bc = edgeLen2D(b, c);
+      const ca = edgeLen2D(c, a);
+      if (depth < maxDepth && Math.max(ab, bc, ca) > maxEdgeDeg) {
+        const mAB = midpoint2D(a, b);
+        const mBC = midpoint2D(b, c);
+        const mCA = midpoint2D(c, a);
+        pushTriSubdivided(a, mAB, mCA, radius, positions, maxEdgeDeg, depth + 1, maxDepth);
+        pushTriSubdivided(mAB, b, mBC, radius, positions, maxEdgeDeg, depth + 1, maxDepth);
+        pushTriSubdivided(mCA, mBC, c, radius, positions, maxEdgeDeg, depth + 1, maxDepth);
+        pushTriSubdivided(mAB, mBC, mCA, radius, positions, maxEdgeDeg, depth + 1, maxDepth);
+        return;
+      }
+
+      const va = lonLatToVector3(a.x, a.y, radius);
+      const vb = lonLatToVector3(b.x, b.y, radius);
+      const vc = lonLatToVector3(c.x, c.y, radius);
+      positions.push(va.x, va.y, va.z, vb.x, vb.y, vb.z, vc.x, vc.y, vc.z);
+    }
+
+    function buildPolygonMesh(rings, radius, material) {
+      if (!rings || rings.length === 0) return null;
+
+      let contour = normalizeRing(rings[0]);
+      if (contour.length < 3) return null;
+      contour = densifyRing(contour, 1.5);
+
+      // Some source polygons contain bad hole rings after antimeridian fixes.
+      // Disable holes here to avoid accidental "hollow" country interiors.
+      const holePoints = [];
+      const triangles = THREE.ShapeUtils.triangulateShape(contour, holePoints);
+      if (!triangles || triangles.length === 0) return null;
+
+      const vertices2D = contour.slice();
+
+      const positions = [];
+      for (const tri of triangles) {
+        const a = vertices2D[tri[0]];
+        const b = vertices2D[tri[1]];
+        const c = vertices2D[tri[2]];
+        pushTriSubdivided(a, b, c, radius, positions, 8, 0, 4);
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geometry.computeVertexNormals();
+
+      return new THREE.Mesh(geometry, material);
+    }
+
+    function buildRingLine(ring, radius, material) {
+      const contour = densifyRing(normalizeRing(ring), 1.2);
+      if (!contour || contour.length < 2) return null;
+
+      const points3D = contour.map((p) => lonLatToVector3(p.x, p.y, radius));
+      points3D.push(points3D[0].clone());
+
+      const geometry = new THREE.BufferGeometry().setFromPoints(points3D);
+      return new THREE.Line(geometry, material);
+    }
+
+    function addCountryPolygons(featureCollection) {
+      const material = new THREE.MeshStandardMaterial({
+        // Country polygon color: all land polygons use this color
+        color: 0x2e5e7e,
+        roughness: 0.9,
+        metalness: 0.02,
+        side: THREE.DoubleSide,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1
+      });
+      const borderMaterial = new THREE.LineBasicMaterial({
+        // Country border color
+        color: 0xffc857,
+        linewidth: 2
+      });
+
+      // Keep polygons far enough above the globe to avoid depth artifacts
+      // from large flat triangles intersecting the sphere volume.
+      const radius = globeRadius + 0.08;
+      const borderRadius = globeRadius + 0.105;
+      for (const featureItem of featureCollection.features) {
+        const geometry = featureItem.geometry;
+        if (!geometry) continue;
+
+        if (geometry.type === 'Polygon') {
+          const mesh = buildPolygonMesh(geometry.coordinates, radius, material);
+          if (mesh) polygonsGroup.add(mesh);
+          for (const ring of geometry.coordinates) {
+            const line = buildRingLine(ring, borderRadius, borderMaterial);
+            if (line) polygonsGroup.add(line);
+          }
+        } else if (geometry.type === 'MultiPolygon') {
+          for (const rings of geometry.coordinates) {
+            const mesh = buildPolygonMesh(rings, radius, material);
+            if (mesh) polygonsGroup.add(mesh);
+            for (const ring of rings) {
+              const line = buildRingLine(ring, borderRadius, borderMaterial);
+              if (line) polygonsGroup.add(line);
+            }
+          }
+        }
+      }
+    }
+
+    async function loadCountries() {
+      try {
+        statusEl.textContent = 'Loading polygons...';
+        const response = await fetch('countries-110m.fixed.geojson');
+        if (!response.ok) throw new Error('Failed to load polygons');
+        const data = await response.json();
+
+        let collection;
+        if (data.type === 'Topology') {
+          const objectKey = Object.keys(data.objects || {})[0];
+          if (!objectKey) throw new Error('TopoJSON has no objects');
+          collection = feature(data, data.objects[objectKey]);
+        } else if (data.type === 'FeatureCollection') {
+          collection = data;
+        } else if (data.type === 'Feature') {
+          collection = { type: 'FeatureCollection', features: [data] };
+        } else {
+          throw new Error('Unsupported GeoJSON/TopoJSON type');
+        }
+
+        addCountryPolygons(collection);
+        statusEl.textContent = `Loaded ${collection.features.length} polygons.`;
+      } catch (err) {
+        statusEl.textContent = 'Failed to load country polygons.';
+      }
+    }
+
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+    window.addEventListener('resize', onResize);
+
+    function animate() {
+      requestAnimationFrame(animate);
+      globe.rotation.y += 0.0005;
+      polygonsGroup.rotation.y += 0.0005;
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    animate();
+    loadCountries();
+  </script>
+</body>
+</html>
