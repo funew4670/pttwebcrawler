@@ -1,0 +1,789 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>World Map 3 - TopoJSON Polygons</title>
+  <link rel="icon" href="data:;base64,=" />
+  <style>
+    :root {
+      color-scheme: light;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      /* Page background (space/sky gradient, not map geometry) */
+      background: radial-gradient(circle at 20% 20%, #1b2a44 0%, #0a0f1a 45%, #05070c 100%);
+      font-family: "Fira Sans", "Segoe UI", system-ui, sans-serif;
+      /* Default text color for UI labels */
+      color: #ebeef1;
+    }
+    #app {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+    #labels {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 5;
+    }
+    .point-label {
+      position: absolute;
+      transform: translate(-50%, -120%);
+      white-space: nowrap;
+      font-size: 11px;
+      line-height: 1.2;
+      color: #ecfff7;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.75);
+      background: rgba(12, 32, 30, 0.45);
+      border: 1px solid rgba(122, 255, 214, 0.35);
+      border-radius: 6px;
+      padding: 2px 5px;
+    }
+    #status {
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      padding: 6px 10px;
+      font-size: 12px;
+      /* Status text color */
+      color: #cfd7e6;
+      /* Status panel background */
+      background: rgba(10, 15, 26, 0.65);
+      /* Status panel border color */
+      border: 1px solid rgba(243, 237, 237, 0.08);
+      border-radius: 8px;
+    }
+    #countryName {
+      position: absolute;
+      top: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 7px 12px;
+      font-size: 14px;
+      color: #f5f8ff;
+      background: rgba(10, 15, 26, 0.75);
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 10px;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.2s ease;
+      z-index: 6;
+    }
+    #countryName.visible {
+      opacity: 1;
+    }
+    canvas {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="labels"></div>
+  <div id="countryName"></div>
+  <div id="status">Loading country polygons...</div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.161.0/examples/jsm/",
+        "topojson-client": "https://cdn.jsdelivr.net/npm/topojson-client@3/+esm"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { feature } from 'topojson-client';
+
+    const app = document.getElementById('app');
+    const labelsEl = document.getElementById('labels');
+    const countryNameEl = document.getElementById('countryName');
+    const statusEl = document.getElementById('status');
+
+    const scene = new THREE.Scene();
+    // Scene fog color (distance haze/background atmosphere)
+    scene.fog = new THREE.Fog(0x05070c, 12, 30);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 3.0, 7.2);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.minDistance = 1.6;
+    controls.maxDistance = 12.0;
+
+    const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(ambient);
+    const directional = new THREE.DirectionalLight(0xffffff, 1.0);
+    directional.position.set(6, 4, 6);
+    scene.add(directional);
+
+    const globeRadius = 2.5;
+    const globeGeometry = new THREE.SphereGeometry(globeRadius, 64, 64);
+    const globeMaterial = new THREE.MeshStandardMaterial({
+      // Globe base color: ocean/planet surface color
+      color: 0xebeef1,
+      roughness: 0.8,
+      metalness: 0.05,
+      // Globe emissive color: subtle night-side glow
+      emissive: 0x081424,
+      emissiveIntensity: 0.4
+    });
+    const globe = new THREE.Mesh(globeGeometry, globeMaterial);
+    scene.add(globe);
+
+    const polygonsGroup = new THREE.Group();
+    scene.add(polygonsGroup);
+    const locationsGroup = new THREE.Group();
+    scene.add(locationsGroup);
+    const pointLabels = [];
+    const countryGroups = [];
+    const pickableCountryMeshes = [];
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    let selectedCountryGroup = null;
+    let pointerDown = null;
+    let taiwanPointsGroup = null;
+    let taiwanPointsLoaded = false;
+    let taiwanPointsLoadingPromise = null;
+    let taiwanPointCount = 0;
+    let isAutoRotateEnabled = true;
+
+    function lonLatToVector3(lon, lat, radius) {
+      const phi = (90 - lat) * (Math.PI / 180);
+      const theta = (lon + 180) * (Math.PI / 180);
+      const x = -radius * Math.sin(phi) * Math.cos(theta);
+      const z = radius * Math.sin(phi) * Math.sin(theta);
+      const y = radius * Math.cos(phi);
+      return new THREE.Vector3(x, y, z);
+    }
+
+    function normalizeRing(ring) {
+      if (!Array.isArray(ring) || ring.length < 3) return [];
+      const clean = ring.slice();
+      const first = clean[0];
+      const last = clean[clean.length - 1];
+      if (first && last && first[0] === last[0] && first[1] === last[1]) {
+        clean.pop();
+      }
+      if (clean.length < 3) return [];
+
+      // Unwrap longitudes to prevent giant triangles across the antimeridian.
+      const out = [];
+      let prevLon = clean[0][0];
+      out.push(new THREE.Vector2(prevLon, clean[0][1]));
+      for (let i = 1; i < clean.length; i++) {
+        let lon = clean[i][0];
+        const lat = clean[i][1];
+        while (lon - prevLon > 180) lon -= 360;
+        while (lon - prevLon < -180) lon += 360;
+        out.push(new THREE.Vector2(lon, lat));
+        prevLon = lon;
+      }
+      return out;
+    }
+
+    function densifyRing(points, maxStepDeg = 1.5) {
+      if (!points || points.length < 2) return points || [];
+      const out = [];
+      for (let i = 0; i < points.length; i++) {
+        const a = points[i];
+        const b = points[(i + 1) % points.length];
+        out.push(a);
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const dist = Math.hypot(dx, dy);
+        const steps = Math.floor(dist / maxStepDeg);
+        if (steps > 0) {
+          for (let s = 1; s <= steps; s++) {
+            const t = s / (steps + 1);
+            out.push(new THREE.Vector2(a.x + dx * t, a.y + dy * t));
+          }
+        }
+      }
+      return out;
+    }
+
+    function midpoint2D(a, b) {
+      return new THREE.Vector2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+    }
+
+    function edgeLen2D(a, b) {
+      return Math.hypot(b.x - a.x, b.y - a.y);
+    }
+
+    function pushTriSubdivided(a, b, c, radius, positions, maxEdgeDeg = 8, depth = 0, maxDepth = 4) {
+      const ab = edgeLen2D(a, b);
+      const bc = edgeLen2D(b, c);
+      const ca = edgeLen2D(c, a);
+      if (depth < maxDepth && Math.max(ab, bc, ca) > maxEdgeDeg) {
+        const mAB = midpoint2D(a, b);
+        const mBC = midpoint2D(b, c);
+        const mCA = midpoint2D(c, a);
+        pushTriSubdivided(a, mAB, mCA, radius, positions, maxEdgeDeg, depth + 1, maxDepth);
+        pushTriSubdivided(mAB, b, mBC, radius, positions, maxEdgeDeg, depth + 1, maxDepth);
+        pushTriSubdivided(mCA, mBC, c, radius, positions, maxEdgeDeg, depth + 1, maxDepth);
+        pushTriSubdivided(mAB, mBC, mCA, radius, positions, maxEdgeDeg, depth + 1, maxDepth);
+        return;
+      }
+
+      const va = lonLatToVector3(a.x, a.y, radius);
+      const vb = lonLatToVector3(b.x, b.y, radius);
+      const vc = lonLatToVector3(c.x, c.y, radius);
+      positions.push(va.x, va.y, va.z, vb.x, vb.y, vb.z, vc.x, vc.y, vc.z);
+    }
+
+    function buildPolygonMesh(rings, radius, material) {
+      if (!rings || rings.length === 0) return null;
+
+      let contour = normalizeRing(rings[0]);
+      if (contour.length < 3) return null;
+      contour = densifyRing(contour, 1.5);
+
+      // Some source polygons contain bad hole rings after antimeridian fixes.
+      // Disable holes here to avoid accidental "hollow" country interiors.
+      const holePoints = [];
+      const triangles = THREE.ShapeUtils.triangulateShape(contour, holePoints);
+      if (!triangles || triangles.length === 0) return null;
+
+      const vertices2D = contour.slice();
+
+      const positions = [];
+      for (const tri of triangles) {
+        const a = vertices2D[tri[0]];
+        const b = vertices2D[tri[1]];
+        const c = vertices2D[tri[2]];
+        pushTriSubdivided(a, b, c, radius, positions, 8, 0, 4);
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geometry.computeVertexNormals();
+
+      return new THREE.Mesh(geometry, material);
+    }
+
+    function buildRingLine(ring, radius, material) {
+      const contour = densifyRing(normalizeRing(ring), 1.2);
+      if (!contour || contour.length < 2) return null;
+
+      const points3D = contour.map((p) => lonLatToVector3(p.x, p.y, radius));
+      points3D.push(points3D[0].clone());
+
+      const geometry = new THREE.BufferGeometry().setFromPoints(points3D);
+      return new THREE.Line(geometry, material);
+    }
+
+    function collectCoords(geometry, out) {
+      if (!geometry || !geometry.type) return;
+      if (geometry.type === 'Point') {
+        out.push(geometry.coordinates);
+        return;
+      }
+      if (geometry.type === 'MultiPoint' || geometry.type === 'LineString') {
+        for (const pt of geometry.coordinates) out.push(pt);
+        return;
+      }
+      if (geometry.type === 'MultiLineString' || geometry.type === 'Polygon') {
+        for (const ring of geometry.coordinates) {
+          for (const pt of ring) out.push(pt);
+        }
+        return;
+      }
+      if (geometry.type === 'MultiPolygon') {
+        for (const poly of geometry.coordinates) {
+          for (const ring of poly) {
+            for (const pt of ring) out.push(pt);
+          }
+        }
+      }
+    }
+
+    function featureCenterLonLat(featureItem) {
+      const coords = [];
+      collectCoords(featureItem.geometry, coords);
+      if (coords.length === 0) return null;
+
+      let minLon = Infinity;
+      let maxLon = -Infinity;
+      let minLat = Infinity;
+      let maxLat = -Infinity;
+      for (const [lon, lat] of coords) {
+        if (lon < minLon) minLon = lon;
+        if (lon > maxLon) maxLon = lon;
+        if (lat < minLat) minLat = lat;
+        if (lat > maxLat) maxLat = lat;
+      }
+      return [(minLon + maxLon) * 0.5, (minLat + maxLat) * 0.5];
+    }
+
+    function addLocationDot(lon, lat, radius, material) {
+      const dot = new THREE.Mesh(new THREE.SphereGeometry(0.00028, 8, 8), material);
+      dot.position.copy(lonLatToVector3(lon, lat, radius));
+      locationsGroup.add(dot);
+      return dot;
+    }
+
+    function addAllFeatureLocations(featureCollection) {
+      const dotMaterial = new THREE.MeshStandardMaterial({
+        // GIS location dot color
+        color: 0xff6b6b,
+        emissive: 0x551818,
+        emissiveIntensity: 0.7,
+        roughness: 0.4,
+        metalness: 0.1
+      });
+      const dotRadius = globeRadius + 0.082;
+
+      let count = 0;
+      for (const featureItem of featureCollection.features) {
+        const center = featureCenterLonLat(featureItem);
+        if (!center) continue;
+        addLocationDot(center[0], center[1], dotRadius, dotMaterial);
+        count += 1;
+      }
+      return count;
+    }
+
+    function getFeatureName(featureItem, fallback = 'Unknown') {
+      const p = featureItem.properties || {};
+      return p.name || p.NAME || p.admin || p.ADMIN || p.MARKNAME2 || p.MARKNAME1 || fallback;
+    }
+
+    function createPointLabel(text) {
+      const el = document.createElement('div');
+      el.className = 'point-label';
+      el.textContent = text;
+      labelsEl.appendChild(el);
+      return el;
+    }
+
+    function updatePointLabels() {
+      const camDir = camera.position.clone().normalize();
+      const size = renderer.getSize(new THREE.Vector2());
+      const tmp = new THREE.Vector3();
+      for (const entry of pointLabels) {
+        if (!entry.dot.visible) {
+          entry.el.style.display = 'none';
+          continue;
+        }
+        entry.dot.getWorldPosition(tmp);
+        const front = tmp.clone().normalize().dot(camDir) > 0;
+        if (!front) {
+          entry.el.style.display = 'none';
+          continue;
+        }
+        tmp.project(camera);
+        if (tmp.z < -1 || tmp.z > 1) {
+          entry.el.style.display = 'none';
+          continue;
+        }
+        const x = (tmp.x * 0.5 + 0.5) * size.x;
+        const y = (-tmp.y * 0.5 + 0.5) * size.y;
+        entry.el.style.display = 'block';
+        entry.el.style.left = `${x}px`;
+        entry.el.style.top = `${y}px`;
+      }
+    }
+
+    function addPointLocations(featureCollection, options = {}) {
+      const color = options.color ?? 0x4ef5c6;
+      const radius = options.radius ?? (globeRadius + 0.082);
+      const size = options.size ?? 0.0006;
+      const parentGroup = options.parentGroup ?? locationsGroup;
+      const labelTag = options.labelTag ?? '';
+      const labelFromCoordinates = options.labelFromCoordinates ?? false;
+      const dotMaterial = new THREE.MeshStandardMaterial({
+        color,
+        emissive: 0x103b30,
+        emissiveIntensity: 0.7,
+        roughness: 0.35,
+        metalness: 0.15
+      });
+
+      let count = 0;
+      for (const featureItem of featureCollection.features || []) {
+        const g = featureItem.geometry;
+        if (!g) continue;
+        const pointName = getFeatureName(featureItem, `Location ${count + 1}`);
+        if (g.type === 'Point') {
+          const [lon, lat] = g.coordinates;
+          const labelText = labelFromCoordinates ? `${lon.toFixed(4)}, ${lat.toFixed(4)}` : pointName;
+          const dot = new THREE.Mesh(new THREE.SphereGeometry(size, 10, 10), dotMaterial);
+          dot.position.copy(lonLatToVector3(lon, lat, radius));
+          parentGroup.add(dot);
+          pointLabels.push({ dot, el: createPointLabel(labelText), tag: labelTag });
+          count += 1;
+        } else if (g.type === 'MultiPoint') {
+          for (const [lon, lat] of g.coordinates) {
+            const labelText = labelFromCoordinates ? `${lon.toFixed(4)}, ${lat.toFixed(4)}` : pointName;
+            const dot = new THREE.Mesh(new THREE.SphereGeometry(size, 10, 10), dotMaterial);
+            dot.position.copy(lonLatToVector3(lon, lat, radius));
+            parentGroup.add(dot);
+            pointLabels.push({ dot, el: createPointLabel(labelText), tag: labelTag });
+            count += 1;
+          }
+        }
+      }
+      return count;
+    }
+
+    function normalizeCountryName(name) {
+      return String(name || '').toLowerCase().replace(/[^a-z]/g, '');
+    }
+
+    function isTaiwanCountry(countryGroup) {
+      const n = normalizeCountryName(countryGroup?.userData?.name);
+      return n === 'taiwan' || n.includes('taiwan');
+    }
+
+    function setTaiwanPointsVisible(visible) {
+      if (taiwanPointsGroup) {
+        taiwanPointsGroup.visible = visible;
+      }
+      for (const entry of pointLabels) {
+        if (entry.tag !== 'taiwan-out') continue;
+        entry.dot.visible = visible;
+        if (!visible) entry.el.style.display = 'none';
+      }
+    }
+
+    function hideTaiwanPoints() {
+      setTaiwanPointsVisible(false);
+    }
+
+    async function ensureTaiwanPointsLoaded(countryGroup) {
+      if (taiwanPointsLoaded) {
+        if (taiwanPointsGroup && taiwanPointsGroup.parent !== countryGroup) {
+          countryGroup.add(taiwanPointsGroup);
+        }
+        setTaiwanPointsVisible(true);
+        return taiwanPointCount;
+      }
+
+      if (!taiwanPointsLoadingPromise) {
+        taiwanPointsLoadingPromise = (async () => {
+          statusEl.textContent = 'Loading Taiwan out.geojson points...';
+          const response = await fetch('out.geojson');
+          if (!response.ok) throw new Error('Failed to load out.geojson');
+          const out = await response.json();
+          let collection = null;
+          if (out.type === 'FeatureCollection') {
+            collection = out;
+          } else if (out.type === 'Feature') {
+            collection = { type: 'FeatureCollection', features: [out] };
+          } else {
+            throw new Error('Unsupported out.geojson type');
+          }
+
+          taiwanPointsGroup = new THREE.Group();
+          countryGroup.add(taiwanPointsGroup);
+          taiwanPointCount = addPointLocations(collection, {
+            color: 0x39f8c1,
+            radius: globeRadius + 0.105,
+            size: 0.001,
+            parentGroup: taiwanPointsGroup,
+            labelTag: 'taiwan-out'
+          });
+          taiwanPointsLoaded = true;
+          return taiwanPointCount;
+        })();
+      }
+
+      try {
+        const count = await taiwanPointsLoadingPromise;
+        if (taiwanPointsGroup && taiwanPointsGroup.parent !== countryGroup) {
+          countryGroup.add(taiwanPointsGroup);
+        }
+        if (selectedCountryGroup === countryGroup) {
+          setTaiwanPointsVisible(true);
+          statusEl.textContent = `Taiwan selected. Loaded ${count} out.geojson points.`;
+        }
+        return count;
+      } catch (err) {
+        statusEl.textContent = 'Failed to load out.geojson points for Taiwan.';
+        throw err;
+      } finally {
+        taiwanPointsLoadingPromise = null;
+      }
+    }
+
+    function addCountryPolygons(featureCollection) {
+      const material = new THREE.MeshStandardMaterial({
+        // Country polygon color: all land polygons use this color
+        color: 0x2e5e7e,
+        roughness: 0.9,
+        metalness: 0.02,
+        side: THREE.DoubleSide,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1
+      });
+      const selectedMaterial = new THREE.MeshStandardMaterial({
+        color: 0x4b9b7e,
+        emissive: 0x143328,
+        emissiveIntensity: 0.55,
+        roughness: 0.85,
+        metalness: 0.02,
+        side: THREE.DoubleSide,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1
+      });
+      const borderMaterial = new THREE.LineBasicMaterial({
+        // Country border color
+        color: 0xffc857,
+        linewidth: 2
+      });
+      const selectedBorderMaterial = new THREE.LineBasicMaterial({
+        color: 0xffe39c,
+        linewidth: 2
+      });
+
+      // Keep polygons far enough above the globe to avoid depth artifacts
+      // from large flat triangles intersecting the sphere volume.
+      const radius = globeRadius + 0.08;
+      const borderRadius = globeRadius + 0.105;
+      for (let fi = 0; fi < featureCollection.features.length; fi++) {
+        const featureItem = featureCollection.features[fi];
+        const geometry = featureItem.geometry;
+        if (!geometry) continue;
+        const countryGroup = new THREE.Group();
+        countryGroup.userData = {
+          name: getFeatureName(featureItem, `Country ${fi + 1}`),
+          meshes: [],
+          lines: [],
+          targetScale: 1,
+          currentScale: 1
+        };
+        countryGroups.push(countryGroup);
+
+        if (geometry.type === 'Polygon') {
+          const mesh = buildPolygonMesh(geometry.coordinates, radius, material);
+          if (mesh) {
+            mesh.userData.countryGroup = countryGroup;
+            countryGroup.userData.meshes.push(mesh);
+            countryGroup.add(mesh);
+            pickableCountryMeshes.push(mesh);
+          }
+          for (const ring of geometry.coordinates) {
+            const line = buildRingLine(ring, borderRadius, borderMaterial);
+            if (line) {
+              countryGroup.userData.lines.push(line);
+              countryGroup.add(line);
+            }
+          }
+        } else if (geometry.type === 'MultiPolygon') {
+          for (const rings of geometry.coordinates) {
+            const mesh = buildPolygonMesh(rings, radius, material);
+            if (mesh) {
+              mesh.userData.countryGroup = countryGroup;
+              countryGroup.userData.meshes.push(mesh);
+              countryGroup.add(mesh);
+              pickableCountryMeshes.push(mesh);
+            }
+            for (const ring of rings) {
+              const line = buildRingLine(ring, borderRadius, borderMaterial);
+              if (line) {
+                countryGroup.userData.lines.push(line);
+                countryGroup.add(line);
+              }
+            }
+          }
+        }
+
+        countryGroup.userData.baseMaterial = material;
+        countryGroup.userData.baseBorderMaterial = borderMaterial;
+        countryGroup.userData.selectedMaterial = selectedMaterial;
+        countryGroup.userData.selectedBorderMaterial = selectedBorderMaterial;
+        polygonsGroup.add(countryGroup);
+      }
+    }
+
+    function computeCountryTargetScale(countryGroup) {
+      const size = renderer.getSize(new THREE.Vector2());
+      const targetW = size.x * 0.1;
+      const targetH = size.y * 0.1;
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      const worldPos = new THREE.Vector3();
+
+      scene.updateMatrixWorld(true);
+      for (const mesh of countryGroup.userData.meshes) {
+        const position = mesh.geometry?.attributes?.position;
+        if (!position) continue;
+        for (let i = 0; i < position.count; i++) {
+          worldPos.fromBufferAttribute(position, i).applyMatrix4(mesh.matrixWorld);
+          worldPos.project(camera);
+          const x = (worldPos.x * 0.5 + 0.5) * size.x;
+          const y = (-worldPos.y * 0.5 + 0.5) * size.y;
+          if (Number.isFinite(x) && Number.isFinite(y)) {
+            minX = Math.min(minX, x);
+            minY = Math.min(minY, y);
+            maxX = Math.max(maxX, x);
+            maxY = Math.max(maxY, y);
+          }
+        }
+      }
+
+      if (!Number.isFinite(minX) || !Number.isFinite(minY)) return 1.08;
+      const boxW = Math.max(1, maxX - minX);
+      const boxH = Math.max(1, maxY - minY);
+      const scale = Math.min(targetW / boxW, targetH / boxH);
+      return THREE.MathUtils.clamp(scale, 1.03, 1.45);
+    }
+
+    function setCountrySelected(countryGroup, selected) {
+      const nextMeshMaterial = selected ? countryGroup.userData.selectedMaterial : countryGroup.userData.baseMaterial;
+      const nextLineMaterial = selected ? countryGroup.userData.selectedBorderMaterial : countryGroup.userData.baseBorderMaterial;
+      for (const mesh of countryGroup.userData.meshes) mesh.material = nextMeshMaterial;
+      for (const line of countryGroup.userData.lines) line.material = nextLineMaterial;
+      countryGroup.userData.targetScale = selected ? computeCountryTargetScale(countryGroup) : 1;
+    }
+
+    function showCountryName(name) {
+      countryNameEl.textContent = name;
+      countryNameEl.classList.add('visible');
+    }
+
+    function hideCountryName() {
+      countryNameEl.classList.remove('visible');
+      countryNameEl.textContent = '';
+    }
+
+    function selectCountry(countryGroup) {
+      if (selectedCountryGroup === countryGroup) return;
+      if (selectedCountryGroup) setCountrySelected(selectedCountryGroup, false);
+      selectedCountryGroup = countryGroup;
+      if (selectedCountryGroup) {
+        setCountrySelected(selectedCountryGroup, true);
+        showCountryName(selectedCountryGroup.userData.name);
+        if (isTaiwanCountry(selectedCountryGroup)) {
+          ensureTaiwanPointsLoaded(selectedCountryGroup).catch(() => {});
+        } else {
+          hideTaiwanPoints();
+        }
+      } else {
+        hideCountryName();
+        hideTaiwanPoints();
+      }
+    }
+
+    function clearCountrySelection() {
+      if (!selectedCountryGroup) return;
+      setCountrySelected(selectedCountryGroup, false);
+      selectedCountryGroup = null;
+      hideCountryName();
+      hideTaiwanPoints();
+    }
+
+    function handleCountryClick(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const hits = raycaster.intersectObjects(pickableCountryMeshes, false);
+      if (hits.length > 0) {
+        const countryGroup = hits[0].object.userData.countryGroup;
+        if (countryGroup) {
+          selectCountry(countryGroup);
+          return;
+        }
+      }
+      clearCountrySelection();
+    }
+
+    renderer.domElement.addEventListener('pointerdown', (event) => {
+      pointerDown = { x: event.clientX, y: event.clientY };
+    });
+
+    renderer.domElement.addEventListener('click', (event) => {
+      if (!pointerDown) return;
+      const dx = event.clientX - pointerDown.x;
+      const dy = event.clientY - pointerDown.y;
+      pointerDown = null;
+      if (Math.hypot(dx, dy) > 4) return;
+      handleCountryClick(event);
+    });
+
+    window.addEventListener('keydown', (event) => {
+      if (event.code !== 'Space') return;
+      event.preventDefault();
+      isAutoRotateEnabled = !isAutoRotateEnabled;
+      statusEl.textContent = isAutoRotateEnabled
+        ? 'Auto-rotate resumed (Space to pause).'
+        : 'Auto-rotate paused (Space to resume).';
+    });
+
+    async function loadCountries() {
+      try {
+        statusEl.textContent = 'Loading polygons...';
+        const response = await fetch('countries-110m.fixed.geojson');
+        if (!response.ok) throw new Error('Failed to load polygons');
+        const data = await response.json();
+
+        let collection;
+        if (data.type === 'Topology') {
+          const objectKey = Object.keys(data.objects || {})[0];
+          if (!objectKey) throw new Error('TopoJSON has no objects');
+          collection = feature(data, data.objects[objectKey]);
+        } else if (data.type === 'FeatureCollection') {
+          collection = data;
+        } else if (data.type === 'Feature') {
+          collection = { type: 'FeatureCollection', features: [data] };
+        } else {
+          throw new Error('Unsupported GeoJSON/TopoJSON type');
+        }
+
+        addCountryPolygons(collection);
+        const worldDotCount = addAllFeatureLocations(collection);
+        statusEl.textContent = `Loaded ${collection.features.length} countries, plotted ${worldDotCount} world centers. Click Taiwan to load out.geojson points.`;
+      } catch (err) {
+        statusEl.textContent = 'Failed to load country polygons.';
+      }
+    }
+
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      updatePointLabels();
+    }
+    window.addEventListener('resize', onResize);
+
+    function animate(now = 0) {
+      requestAnimationFrame(animate);
+      if (isAutoRotateEnabled) {
+        globe.rotation.y += 0.0005;
+        polygonsGroup.rotation.y += 0.0005;
+        locationsGroup.rotation.y += 0.0005;
+      }
+      for (const countryGroup of countryGroups) {
+        const u = countryGroup.userData;
+        u.currentScale = THREE.MathUtils.lerp(u.currentScale, u.targetScale, 0.15);
+        countryGroup.scale.setScalar(u.currentScale);
+      }
+      controls.update();
+      updatePointLabels();
+      renderer.render(scene, camera);
+    }
+    animate();
+    loadCountries();
+  </script>
+</body>
+</html>
