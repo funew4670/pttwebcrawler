@@ -1,0 +1,560 @@
+﻿<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>World Map 5 - Flat Map Zoom</title>
+  <link rel="icon" href="data:;base64,=" />
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: linear-gradient(180deg, #d9ecff 0%, #eef6ff 45%, #f8fbff 100%);
+      font-family: "Segoe UI", "Noto Sans TC", sans-serif;
+    }
+
+    #app {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+
+    svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: grab;
+      touch-action: none;
+    }
+
+    svg:active {
+      cursor: grabbing;
+    }
+
+    .country {
+      fill: #76b37f;
+      stroke: #ffffff;
+      stroke-width: 0.6;
+      vector-effect: non-scaling-stroke;
+      transition: fill 0.2s ease;
+    }
+
+    .country:hover {
+      fill: #5da86b;
+    }
+
+    .country.selected {
+      fill: #5ea96d;
+      stroke: #ffe082;
+      stroke-width: 1.2;
+    }
+
+    .floating-country {
+      fill: #2f8d48;
+      stroke: #ffe082;
+      stroke-width: 1.6;
+      vector-effect: non-scaling-stroke;
+      filter: drop-shadow(0 8px 10px rgba(0, 0, 0, 0.25));
+      pointer-events: none;
+    }
+
+    .poi-dot {
+      fill: #ff6f3c;
+      stroke: #ffffff;
+      stroke-width: 1.4;
+      vector-effect: non-scaling-stroke;
+      pointer-events: none;
+    }
+
+    #countryName {
+      position: absolute;
+      top: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 8px 12px;
+      font-size: 16px;
+      font-weight: 600;
+      color: #1e2a36;
+      background: rgba(255, 255, 255, 0.92);
+      border: 1px solid rgba(0, 0, 0, 0.1);
+      border-radius: 10px;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.2s ease;
+    }
+
+    #countryName.visible {
+      opacity: 1;
+    }
+
+    #status {
+      position: absolute;
+      left: 12px;
+      bottom: 12px;
+      padding: 6px 10px;
+      font-size: 12px;
+      color: #1e2a36;
+      background: rgba(255, 255, 255, 0.9);
+      border: 1px solid rgba(0, 0, 0, 0.08);
+      border-radius: 8px;
+      pointer-events: none;
+    }
+
+    #sidebar {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      width: 320px;
+      max-width: calc(100vw - 24px);
+      max-height: calc(100vh - 24px);
+      display: flex;
+      flex-direction: column;
+      background: rgba(255, 255, 255, 0.95);
+      border: 1px solid rgba(0, 0, 0, 0.1);
+      border-radius: 12px;
+      box-shadow: 0 10px 20px rgba(0, 0, 0, 0.12);
+      z-index: 10;
+      overflow: hidden;
+    }
+
+    #sidebarHeader {
+      padding: 10px 12px;
+      font-size: 14px;
+      font-weight: 700;
+      color: #1e2a36;
+      background: #f4f9ff;
+      border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+    }
+
+    #sidebarBody {
+      padding: 10px 12px;
+      overflow: auto;
+      font-size: 13px;
+      color: #2b3a48;
+      line-height: 1.4;
+    }
+
+    .explorer-title {
+      margin: 0 0 8px 0;
+      font-size: 13px;
+      font-weight: 700;
+      color: #19466f;
+    }
+
+    .country-node {
+      font-size: 13px;
+      font-weight: 700;
+      margin-bottom: 8px;
+      color: #234f30;
+    }
+
+    .poi-list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .poi-btn {
+      width: 100%;
+      text-align: left;
+      border: 1px solid rgba(0, 0, 0, 0.1);
+      background: #ffffff;
+      color: #1e2a36;
+      border-radius: 8px;
+      padding: 7px 8px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .poi-btn:hover {
+      background: #eef6ff;
+      border-color: rgba(35, 95, 150, 0.35);
+    }
+
+    .poi-btn.active {
+      background: #dceeff;
+      border-color: #2d78b6;
+      color: #113654;
+      font-weight: 700;
+    }
+
+    .hint {
+      color: #5a6773;
+      font-size: 12px;
+    }
+
+    @media (max-width: 720px) {
+      #sidebar {
+        width: min(92vw, 360px);
+        max-height: 42vh;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <svg id="map" aria-label="Flat world map"></svg>
+    <aside id="sidebar" aria-label="Data Layers">
+      <div id="sidebarHeader">Dynamic Layer</div>
+      <div id="sidebarBody"></div>
+    </aside>
+    <div id="countryName"></div>
+    <div id="status">載入地圖中...</div>
+  </div>
+
+  <script type="module">
+    import * as d3 from 'https://cdn.jsdelivr.net/npm/d3@7/+esm';
+
+    const svg = d3.select('#map');
+    const statusEl = document.getElementById('status');
+    const countryNameEl = document.getElementById('countryName');
+    const sidebarBodyEl = document.getElementById('sidebarBody');
+    const g = svg.append('g');
+    const mapLayer = g.append('g');
+    const poiLayer = g.append('g');
+    const focusLayer = g.append('g');
+    const focusPoiLayer = focusLayer.append('g');
+
+    const projection = d3.geoNaturalEarth1();
+    const path = d3.geoPath(projection);
+
+    let worldData = null;
+    let countryPaths = null;
+    let selectedFeature = null;
+    let activeCountryKey = null;
+    let activePoi = null;
+
+    const COUNTRY_DATASETS = {
+      taiwan: './out.geojson'
+    };
+    const datasetCache = new Map();
+
+    const zoom = d3.zoom()
+      .scaleExtent([1, 12])
+      .on('zoom', (event) => {
+        g.attr('transform', event.transform);
+      });
+
+    function getViewSize() {
+      const rect = svg.node().getBoundingClientRect();
+      return {
+        width: Math.max(320, rect.width),
+        height: Math.max(240, rect.height)
+      };
+    }
+
+    function getFloatingTransform(feature, scale) {
+      const centroid = path.centroid(feature);
+      return `translate(${centroid[0]},${centroid[1]}) scale(${scale}) translate(${-centroid[0]},${-centroid[1]})`;
+    }
+
+    function normalizeCountryName(name) {
+      return String(name || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+    }
+
+    function getFeatureName(featureItem, fallback = 'Unknown') {
+      const p = featureItem?.properties || {};
+      return p.name
+        || p.NAME
+        || p.admin
+        || p.ADMIN
+        || p.MARKNAME1
+        || p.MARKNAME2
+        || p.title
+        || p.Title
+        || p.label
+        || p.LABEL
+        || p.MARKID
+        || (p.OBJECTID != null ? `POI-${p.OBJECTID}` : null)
+        || fallback;
+    }
+
+    function getCountryKey(featureItem) {
+      return normalizeCountryName(getFeatureName(featureItem, ''));
+    }
+
+    function getFloatingScale(feature) {
+      const { width, height } = getViewSize();
+      const bounds = path.bounds(feature);
+      const dx = Math.max(1, bounds[1][0] - bounds[0][0]);
+      const dy = Math.max(1, bounds[1][1] - bounds[0][1]);
+      const targetW = width * 0.1;
+      const targetH = height * 0.1;
+      const scale = Math.min(targetW / dx, targetH / dy);
+      return Math.max(1.05, Math.min(8, scale));
+    }
+
+    function pointRowsFromGeoJSON(data) {
+      const rows = [];
+      const collection = data?.type === 'FeatureCollection'
+        ? data.features
+        : data?.type === 'Feature'
+          ? [data]
+          : [];
+      for (const featureItem of collection) {
+        const geometry = featureItem?.geometry;
+        if (!geometry) continue;
+        const baseName = getFeatureName(featureItem, `POI-${rows.length + 1}`);
+        if (geometry.type === 'Point') {
+          const [lon, lat] = geometry.coordinates;
+          rows.push({ id: `${baseName}-${rows.length}`, name: baseName, lon, lat });
+        } else if (geometry.type === 'MultiPoint') {
+          geometry.coordinates.forEach(([lon, lat], i) => {
+            rows.push({ id: `${baseName}-${rows.length}`, name: `${baseName} #${i + 1}`, lon, lat });
+          });
+        }
+      }
+      return rows;
+    }
+
+    async function loadCountryDataset(countryKey) {
+      if (!COUNTRY_DATASETS[countryKey]) return [];
+      if (datasetCache.has(countryKey)) return datasetCache.get(countryKey);
+      const url = COUNTRY_DATASETS[countryKey];
+      const data = await d3.json(url);
+      const rows = pointRowsFromGeoJSON(data);
+      datasetCache.set(countryKey, rows);
+      return rows;
+    }
+
+    function showCountryName(name) {
+      countryNameEl.textContent = name;
+      countryNameEl.classList.add('visible');
+    }
+
+    function hideCountryName() {
+      countryNameEl.classList.remove('visible');
+      countryNameEl.textContent = '';
+    }
+
+    function clearPoiPlot() {
+      poiLayer.selectAll('*').remove();
+      focusPoiLayer.selectAll('*').remove();
+    }
+
+    function renderActivePoi() {
+      clearPoiPlot();
+      if (!activePoi) return;
+      const projected = projection([activePoi.lon, activePoi.lat]);
+      if (!projected) return;
+      const [x, y] = projected;
+
+      const useFocusLayer = selectedFeature && getCountryKey(selectedFeature) === activePoi.countryKey;
+      const layer = useFocusLayer ? focusPoiLayer : poiLayer;
+      const point = layer.append('circle')
+        .attr('class', 'poi-dot')
+        .attr('cx', x)
+        .attr('cy', y)
+        .attr('r', 0.275);
+
+      point.append('title').text(activePoi.name);
+
+      if (useFocusLayer) {
+        layer.attr('transform', getFloatingTransform(selectedFeature, getFloatingScale(selectedFeature)));
+        layer.raise();
+      } else {
+        layer.attr('transform', null);
+      }
+    }
+
+    function renderExplorerPlaceholder(message) {
+      sidebarBodyEl.innerHTML = [
+        '<div class="explorer-title">Hierarchical Data Explorer</div>',
+        `<div class="hint">${message}</div>`
+      ].join('');
+    }
+
+    function setActivePoiById(id) {
+      const rows = datasetCache.get(activeCountryKey) || [];
+      const nextPoi = rows.find((r) => r.id === id) || null;
+      activePoi = nextPoi ? { ...nextPoi, countryKey: activeCountryKey } : null;
+      renderActivePoi();
+      renderExplorerList(rows);
+    }
+
+    function renderExplorerList(rows) {
+      const countryName = selectedFeature ? getFeatureName(selectedFeature, 'Unknown') : 'Unknown';
+      const listHtml = rows.map((row) => {
+        const activeClass = activePoi?.id === row.id ? ' active' : '';
+        return `<li><button class="poi-btn${activeClass}" data-poi-id="${row.id}">${row.name}</button></li>`;
+      }).join('');
+
+      sidebarBodyEl.innerHTML = [
+        '<div class="explorer-title">Hierarchical Data Explorer</div>',
+        `<div class="country-node">Country: ${countryName}</div>`,
+        listHtml ? `<ul class="poi-list">${listHtml}</ul>` : '<div class="hint">這個國家目前沒有可載入的資料。</div>'
+      ].join('');
+
+      sidebarBodyEl.querySelectorAll('.poi-btn').forEach((btn) => {
+        btn.addEventListener('click', (event) => {
+          const id = event.currentTarget.getAttribute('data-poi-id');
+          setActivePoiById(id);
+        });
+      });
+    }
+
+    async function loadExplorerForFeature(feature) {
+      if (!feature) {
+        activeCountryKey = null;
+        activePoi = null;
+        clearPoiPlot();
+        renderExplorerPlaceholder('請先點選國家。');
+        return;
+      }
+
+      const countryKey = getCountryKey(feature);
+      activeCountryKey = countryKey;
+      activePoi = null;
+      clearPoiPlot();
+
+      const datasetUrl = COUNTRY_DATASETS[countryKey];
+      if (!datasetUrl) {
+        renderExplorerPlaceholder(`"${getFeatureName(feature)}" 尚未設定資料來源。`);
+        return;
+      }
+
+      renderExplorerPlaceholder(`載入 ${getFeatureName(feature)} 資料中...`);
+      try {
+        const rows = await loadCountryDataset(countryKey);
+        if (activeCountryKey !== countryKey) return;
+        renderExplorerList(rows);
+        statusEl.textContent = `已載入 ${getFeatureName(feature)} 資料，共 ${rows.length} 筆。`;
+      } catch (err) {
+        console.error(err);
+        if (activeCountryKey !== countryKey) return;
+        renderExplorerPlaceholder(`資料載入失敗: ${err.message}`);
+      }
+    }
+
+    function drawFloatingCountry(feature, animate = true) {
+      if (!feature) {
+        focusLayer.selectAll('path.floating-country')
+          .transition()
+          .duration(180)
+          .style('opacity', 0)
+          .remove();
+        focusPoiLayer.selectAll('*').remove();
+        return;
+      }
+
+      const floating = focusLayer.selectAll('path.floating-country')
+        .data([feature]);
+      const floatingScale = getFloatingScale(feature);
+
+      floating.join(
+        (enter) => enter.append('path')
+          .attr('class', 'floating-country')
+          .attr('d', path)
+          .attr('transform', getFloatingTransform(feature, 1))
+          .style('opacity', 0)
+          .call((sel) => {
+            if (animate) {
+              sel.transition()
+                .duration(360)
+                .style('opacity', 1)
+                .attr('transform', getFloatingTransform(feature, floatingScale));
+            } else {
+              sel.style('opacity', 1)
+                .attr('transform', getFloatingTransform(feature, floatingScale));
+            }
+          }),
+        (update) => update
+          .attr('d', path)
+          .call((sel) => {
+            if (animate) {
+              sel.transition()
+                .duration(260)
+                .style('opacity', 1)
+                .attr('transform', getFloatingTransform(feature, floatingScale));
+            } else {
+              sel.style('opacity', 1)
+                .attr('transform', getFloatingTransform(feature, floatingScale));
+            }
+          }),
+        (exit) => exit.remove()
+      );
+      focusPoiLayer.raise();
+      renderActivePoi();
+    }
+
+    function focusCountry(feature, animate = true) {
+      selectedFeature = feature;
+      countryPaths.classed('selected', (d) => d === feature);
+      showCountryName(feature?.properties?.name || 'Unknown');
+      drawFloatingCountry(feature, animate);
+      loadExplorerForFeature(feature);
+    }
+
+    function resetFocus() {
+      selectedFeature = null;
+      if (countryPaths) {
+        countryPaths.classed('selected', false);
+      }
+      hideCountryName();
+      drawFloatingCountry(null, false);
+      loadExplorerForFeature(null);
+    }
+
+    function render() {
+      const { width, height } = getViewSize();
+      projection.fitExtent([[20, 20], [width - 20, height - 20]], worldData);
+
+      countryPaths = mapLayer.selectAll('path.country')
+        .data(worldData.features)
+        .join(
+          (enter) => {
+            const p = enter.append('path').attr('class', 'country');
+            p.append('title');
+            return p;
+          },
+          (update) => update,
+          (exit) => exit.remove()
+        )
+        .attr('d', path)
+        .on('click', (event, d) => {
+          event.stopPropagation();
+          focusCountry(d, true);
+        });
+
+      countryPaths.each(function(d) {
+        d3.select(this).select('title').text(d?.properties?.name || 'Unknown');
+      });
+
+      if (selectedFeature) {
+        focusCountry(selectedFeature, false);
+      } else {
+        resetFocus();
+      }
+      renderActivePoi();
+    }
+
+    async function loadAndRender() {
+      try {
+        worldData = await d3.json('./countries-110m.fixed.geojson');
+        if (!worldData || !Array.isArray(worldData.features)) {
+          throw new Error('GeoJSON 格式不正確');
+        }
+
+        svg.call(zoom);
+        svg.on('click', () => resetFocus());
+        renderExplorerPlaceholder('請先點選國家。');
+
+        render();
+        window.addEventListener('resize', render);
+
+        statusEl.textContent = '點國家後可在右側 Hierarchical Data Explorer 載入並切換單一景點 plotting。';
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = `載入失敗: ${err.message}`;
+      }
+    }
+
+    loadAndRender();
+  </script>
+</body>
+</html>
